@@ -88,11 +88,15 @@ export default async function handler(
       }
     };
 
+    // Generate unique request ID for idempotency
+    const requestId = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    
     const orderResponse = await fetch(`${baseUrl}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${tokenData.access_token}`,
+        'PayPal-Request-Id': requestId,
       },
       body: JSON.stringify(orderData),
     });

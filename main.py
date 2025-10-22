@@ -1,6 +1,8 @@
 from flask import Flask, render_template_string, request, jsonify
 import requests
 import json
+import uuid
+import time
 
 app = Flask(__name__)
 
@@ -23,10 +25,12 @@ def get_paypal_access_token():
 # Charge Card via REST API
 def charge_card(amount, currency='USD', card_number=None, exp_month=None, exp_year=None, cvv=None, first_name='Test', last_name='User'):
     token = get_paypal_access_token()
+    # Generate unique request ID for idempotency
+    request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {token}',
-        'PayPal-Request-Id': 'unique-id'  # Prevent dupes
+        'PayPal-Request-Id': request_id  # Prevent dupes
     }
     
     # Step 1: Create Order
