@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import { randomUUID } from 'crypto';
 
 export default async function handler(
   req: NextApiRequest,
@@ -8,9 +9,9 @@ export default async function handler(
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { 
-    clientId, 
-    clientSecret, 
+  const {
+    clientId,
+    clientSecret,
     environment,
     amount,
     currency,
@@ -27,10 +28,67 @@ export default async function handler(
     countryCode
   } = req.body;
 
-  if (!clientId || !clientSecret || !environment || !amount || !cardNumber || !expMonth || !expYear || !cvv) {
-    return res.status(400).json({ 
+  const toOptionalString = (value: unknown): string | undefined => {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+
+    const stringValue = String(value).trim();
+    return stringValue.length > 0 ? stringValue : undefined;
+  };
+
+  const normalizedAmountInput = toOptionalString(amount);
+  const normalizedAmount = normalizedAmountInput
+    ? Number.parseFloat(normalizedAmountInput)
+    : Number.NaN;
+  const sanitizedCardNumber = toOptionalString(cardNumber)?.replace(/\s+/g, '');
+  const sanitizedExpMonthInput = toOptionalString(expMonth);
+  const sanitizedExpYearInput = toOptionalString(expYear);
+  const sanitizedCvv = toOptionalString(cvv);
+  const normalizedCardNumber = sanitizedCardNumber
+    ? sanitizedCardNumber.replace(/\D/g, '')
+    : undefined;
+  const normalizedExpMonth = sanitizedExpMonthInput
+    ? sanitizedExpMonthInput.replace(/\D/g, '')
+    : undefined;
+  const normalizedExpYear = sanitizedExpYearInput
+    ? sanitizedExpYearInput.replace(/\D/g, '')
+    : undefined;
+  const normalizedCvv = sanitizedCvv ? sanitizedCvv.replace(/\D/g, '') : undefined;
+  const normalizedExpMonthNumber = normalizedExpMonth
+    ? Number.parseInt(normalizedExpMonth, 10)
+    : Number.NaN;
+  const isValidExpYearLength = normalizedExpYear
+    ? normalizedExpYear.length === 2 || normalizedExpYear.length === 4
+    : false;
+  const isValidCvvLength = normalizedCvv
+    ? normalizedCvv.length >= 3 && normalizedCvv.length <= 4
+    : false;
+  const isValidCardNumberLength = normalizedCardNumber
+    ? normalizedCardNumber.length >= 12 && normalizedCardNumber.length <= 19
+    : false;
+
+  if (
+    !clientId ||
+    !clientSecret ||
+    !environment ||
+    !normalizedAmountInput ||
+    !normalizedCardNumber ||
+    !normalizedExpMonth ||
+    !normalizedExpYear ||
+    !normalizedCvv ||
+    Number.isNaN(normalizedAmount) ||
+    normalizedAmount <= 0 ||
+    Number.isNaN(normalizedExpMonthNumber) ||
+    normalizedExpMonthNumber < 1 ||
+    normalizedExpMonthNumber > 12 ||
+    !isValidExpYearLength ||
+    !isValidCvvLength ||
+    !isValidCardNumberLength
+  ) {
+    return res.status(400).json({
       success: false,
-      error: 'Missing required fields' 
+      error: 'Missing required fields or invalid payment details'
     });
   }
 
@@ -52,10 +110,15 @@ export default async function handler(
       body: 'grant_type=client_credentials',
     });
 
-    const tokenData = await tokenResponse.json();
+    let tokenData: any = null;
+    try {
+      tokenData = await tokenResponse.json();
+    } catch (_error) {
+      tokenData = null;
+    }
 
-    if (!tokenResponse.ok || !tokenData.access_token) {
-      return res.status(200).json({ 
+    if (!tokenResponse.ok || !tokenData?.access_token) {
+      return res.status(tokenResponse.status || 502).json({
         success: false,
         error: 'Authentication failed',
         details: tokenData
@@ -63,48 +126,95 @@ export default async function handler(
     }
 
     // Step 2: Create Order with Card Details
+    const paddedExpMonth = normalizedExpMonth.padStart(2, '0');
+    const expandedExpYear = normalizedExpYear.length === 2
+      ? `20${normalizedExpYear}`
+      : normalizedExpYear.padStart(4, '0');
+
+    const cardPayload: Record<string, unknown> = {
+      number: normalizedCardNumber,
+      expiry: `${expandedExpYear}-${paddedExpMonth}`,
+      security_code: normalizedCvv
+    };
+
+    if (firstName || lastName) {
+      const namePayload: Record<string, string> = {};
+      const normalizedFirstName = toOptionalString(firstName);
+      const normalizedLastName = toOptionalString(lastName);
+
+      if (normalizedFirstName) {
+        namePayload.given_name = normalizedFirstName;
+      }
+      if (normalizedLastName) {
+        namePayload.surname = normalizedLastName;
+      }
+
+      if (Object.keys(namePayload).length > 0) {
+        cardPayload.name = namePayload;
+      }
+    }
+
+    const billingAddressEntries: [string, string | undefined][] = [
+      ['address_line_1', toOptionalString(addressLine1)],
+      ['admin_area_2', toOptionalString(city)],
+      ['admin_area_1', toOptionalString(state)],
+      ['postal_code', toOptionalString(postalCode)],
+      ['country_code', toOptionalString(countryCode)?.toUpperCase()]
+    ];
+
+    const billingAddress = Object.fromEntries(
+      billingAddressEntries.filter(([, value]) => Boolean(value)) as [string, string][]
+    );
+
+    if (Object.keys(billingAddress).length > 0) {
+      cardPayload.billing_address = billingAddress;
+    }
+
     const orderData = {
       intent: 'CAPTURE',
       purchase_units: [{
         amount: {
-          currency_code: currency || 'USD',
-          value: parseFloat(amount).toFixed(2)
+          currency_code: String(currency || 'USD').toUpperCase(),
+          value: normalizedAmount.toFixed(2)
         }
       }],
       payment_source: {
-        card: {
-          number: cardNumber.replace(/\s/g, ''),
-          expiry: `${expYear}-${String(expMonth).padStart(2, '0')}`,
-          security_code: cvv,
-          name: `${firstName || 'John'} ${lastName || 'Doe'}`,
-          billing_address: {
-            address_line_1: addressLine1 || '123 Main St',
-            admin_area_2: city || 'San Jose',
-            admin_area_1: state || 'CA',
-            postal_code: postalCode || '95131',
-            country_code: countryCode || 'US'
-          }
-        }
+        card: cardPayload
       }
     };
 
     // Generate unique request ID for idempotency
-    const requestId = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    
+    const requestId = randomUUID().replace(/-/g, '');
+
     const orderResponse = await fetch(`${baseUrl}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/json',
         'Authorization': `Bearer ${tokenData.access_token}`,
         'PayPal-Request-Id': requestId,
+        'Prefer': 'return=representation'
       },
       body: JSON.stringify(orderData),
     });
 
-    const orderResult = await orderResponse.json();
+    let orderResult: any = null;
+    try {
+      orderResult = await orderResponse.json();
+    } catch (_error) {
+      orderResult = null;
+    }
 
     if (!orderResponse.ok) {
-      return res.status(200).json({ 
+      return res.status(orderResponse.status || 502).json({
+        success: false,
+        error: 'Order creation failed',
+        details: orderResult
+      });
+    }
+
+    if (!orderResult?.id) {
+      return res.status(502).json({
         success: false,
         error: 'Order creation failed',
         details: orderResult
@@ -118,15 +228,23 @@ export default async function handler(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Accept': 'application/json',
           'Authorization': `Bearer ${tokenData.access_token}`,
+          'PayPal-Request-Id': randomUUID().replace(/-/g, ''),
+          'Prefer': 'return=representation'
         },
       }
     );
 
-    const captureResult = await captureResponse.json();
+    let captureResult: any = null;
+    try {
+      captureResult = await captureResponse.json();
+    } catch (_error) {
+      captureResult = null;
+    }
 
-    if (captureResponse.ok && captureResult.status === 'COMPLETED') {
-      return res.status(200).json({ 
+    if (captureResponse.ok && captureResult?.status === 'COMPLETED') {
+      return res.status(200).json({
         success: true,
         message: 'Payment captured successfully',
         orderId: captureResult.id,
@@ -134,7 +252,11 @@ export default async function handler(
         details: captureResult
       });
     } else {
-      return res.status(200).json({ 
+      const failureStatus = captureResponse.status >= 400
+        ? captureResponse.status
+        : 502;
+
+      return res.status(failureStatus).json({
         success: false,
         error: 'Payment capture failed',
         details: captureResult
