@@ -1,6 +1,56 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { randomUUID } from 'crypto';
 
+type PayPalResponse = {
+  response: Response;
+  result: any;
+};
+
+const parseJson = async (response: Response) => {
+  try {
+    return await response.json();
+  } catch (_error) {
+    return null;
+  }
+};
+
+const extractIssueCodes = (details: any): string[] => {
+  if (!Array.isArray(details)) {
+    return [];
+  }
+
+  return details
+    .map((detail) => (typeof detail?.issue === 'string' ? detail.issue : undefined))
+    .filter((issue): issue is string => Boolean(issue));
+};
+
+const findFirstCapture = (order: any) => {
+  const purchaseUnits = Array.isArray(order?.purchase_units) ? order.purchase_units : [];
+
+  for (const unit of purchaseUnits) {
+    const captures = Array.isArray(unit?.payments?.captures) ? unit.payments.captures : [];
+
+    if (captures.length > 0) {
+      return captures[0];
+    }
+  }
+
+  return undefined;
+};
+
+const buildSuccessPayload = (order: any, capture?: any) => {
+  const captureDetails = capture ?? findFirstCapture(order);
+
+  return {
+    success: true,
+    message: 'Payment captured successfully',
+    orderId: order?.id,
+    captureId: captureDetails?.id,
+    status: captureDetails?.status ?? order?.status,
+    details: captureDetails ?? order
+  };
+};
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
@@ -93,13 +143,12 @@ export default async function handler(
   }
 
   try {
-    const baseUrl = environment === 'live' 
-      ? 'https://api-m.paypal.com' 
+    const baseUrl = environment === 'live'
+      ? 'https://api-m.paypal.com'
       : 'https://api-m.sandbox.paypal.com';
 
-    // Step 1: Get Access Token
     const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    
+
     const tokenResponse = await fetch(`${baseUrl}/v1/oauth2/token`, {
       method: 'POST',
       headers: {
@@ -110,12 +159,7 @@ export default async function handler(
       body: 'grant_type=client_credentials',
     });
 
-    let tokenData: any = null;
-    try {
-      tokenData = await tokenResponse.json();
-    } catch (_error) {
-      tokenData = null;
-    }
+    const tokenData = await parseJson(tokenResponse);
 
     if (!tokenResponse.ok || !tokenData?.access_token) {
       return res.status(tokenResponse.status || 502).json({
@@ -125,7 +169,6 @@ export default async function handler(
       });
     }
 
-    // Step 2: Create Order with Card Details
     const paddedExpMonth = normalizedExpMonth.padStart(2, '0');
     const expandedExpYear = normalizedExpYear.length === 2
       ? `20${normalizedExpYear}`
@@ -178,87 +221,116 @@ export default async function handler(
       }
     };
 
-    // Generate unique request ID for idempotency
-    const requestId = randomUUID().replace(/-/g, '');
+    const accessToken = tokenData.access_token as string;
 
-    const orderResponse = await fetch(`${baseUrl}/v2/checkout/orders`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': `Bearer ${tokenData.access_token}`,
-        'PayPal-Request-Id': requestId,
-        'Prefer': 'return=representation'
-      },
-      body: JSON.stringify(orderData),
-    });
-
-    let orderResult: any = null;
-    try {
-      orderResult = await orderResponse.json();
-    } catch (_error) {
-      orderResult = null;
-    }
-
-    if (!orderResponse.ok) {
-      return res.status(orderResponse.status || 502).json({
-        success: false,
-        error: 'Order creation failed',
-        details: orderResult
-      });
-    }
-
-    if (!orderResult?.id) {
-      return res.status(502).json({
-        success: false,
-        error: 'Order creation failed',
-        details: orderResult
-      });
-    }
-
-    // Step 3: Capture Payment
-    const captureResponse = await fetch(
-      `${baseUrl}/v2/checkout/orders/${orderResult.id}/capture`,
-      {
+    const createOrder = async (): Promise<PayPalResponse> => {
+      const response = await fetch(`${baseUrl}/v2/checkout/orders`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
-          'Authorization': `Bearer ${tokenData.access_token}`,
+          'Authorization': `Bearer ${accessToken}`,
           'PayPal-Request-Id': randomUUID().replace(/-/g, ''),
           'Prefer': 'return=representation'
         },
-      }
-    );
-
-    let captureResult: any = null;
-    try {
-      captureResult = await captureResponse.json();
-    } catch (_error) {
-      captureResult = null;
-    }
-
-    if (captureResponse.ok && captureResult?.status === 'COMPLETED') {
-      return res.status(200).json({
-        success: true,
-        message: 'Payment captured successfully',
-        orderId: captureResult.id,
-        status: captureResult.status,
-        details: captureResult
+        body: JSON.stringify(orderData)
       });
-    } else {
-      const failureStatus = captureResponse.status >= 400
-        ? captureResponse.status
-        : 502;
 
-      return res.status(failureStatus).json({
+      return {
+        response,
+        result: await parseJson(response)
+      };
+    };
+
+    const getOrder = async (orderId: string): Promise<PayPalResponse> => {
+      const response = await fetch(`${baseUrl}/v2/checkout/orders/${orderId}`, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'Prefer': 'return=representation'
+        }
+      });
+
+      return {
+        response,
+        result: await parseJson(response)
+      };
+    };
+
+    const captureOrder = async (orderId: string, idempotencyKey: string): Promise<PayPalResponse> => {
+      const response = await fetch(`${baseUrl}/v2/checkout/orders/${orderId}/capture`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+          'PayPal-Request-Id': idempotencyKey,
+          'Prefer': 'return=representation'
+        }
+      });
+
+      return {
+        response,
+        result: await parseJson(response)
+      };
+    };
+
+    const orderCreation = await createOrder();
+
+    if (!orderCreation.response.ok || !orderCreation.result?.id) {
+      return res.status(orderCreation.response.status || 502).json({
         success: false,
-        error: 'Payment capture failed',
-        details: captureResult
+        error: 'Order creation failed',
+        details: orderCreation.result
       });
     }
+
+    const orderId: string = orderCreation.result.id;
+    const initialStatus: string | undefined = orderCreation.result.status;
+
+    if (initialStatus === 'COMPLETED') {
+      return res.status(200).json(buildSuccessPayload(orderCreation.result));
+    }
+
+    const preCaptureSnapshot = await getOrder(orderId);
+
+    if (preCaptureSnapshot.response.ok && preCaptureSnapshot.result?.status === 'COMPLETED') {
+      return res.status(200).json(buildSuccessPayload(preCaptureSnapshot.result));
+    }
+
+    const captureIdempotencyKey = randomUUID().replace(/-/g, '');
+    const captureAttempt = await captureOrder(orderId, captureIdempotencyKey);
+
+    if (captureAttempt.response.ok && captureAttempt.result?.status === 'COMPLETED') {
+      return res.status(200).json(buildSuccessPayload(captureAttempt.result));
+    }
+
+    const captureIssues = extractIssueCodes(captureAttempt.result?.details);
+
+    if (captureIssues.includes('ORDER_ALREADY_CAPTURED')) {
+      const postCaptureSnapshot = await getOrder(orderId);
+
+      if (postCaptureSnapshot.response.ok && postCaptureSnapshot.result?.status === 'COMPLETED') {
+        return res.status(200).json(buildSuccessPayload(postCaptureSnapshot.result));
+      }
+    }
+
+    const failureStatus = captureAttempt.response.status >= 400
+      ? captureAttempt.response.status
+      : 502;
+
+    return res.status(failureStatus).json({
+      success: false,
+      error: 'Payment capture failed',
+      details: captureAttempt.result,
+      attempts: {
+        order: orderCreation.result,
+        capture: captureAttempt.result
+      }
+    });
   } catch (error: any) {
-    return res.status(500).json({ 
+    return res.status(500).json({
       success: false,
       error: error.message || 'Payment processing failed',
       details: error
