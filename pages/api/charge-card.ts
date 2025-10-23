@@ -178,87 +178,179 @@ export default async function handler(
       }
     };
 
-    // Generate unique request ID for idempotency
-    const requestId = randomUUID().replace(/-/g, '');
+    type FetchOutcome = {
+      response: Response;
+      result: any;
+    };
 
-    const orderResponse = await fetch(`${baseUrl}/v2/checkout/orders`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': `Bearer ${tokenData.access_token}`,
-        'PayPal-Request-Id': requestId,
-        'Prefer': 'return=representation'
-      },
-      body: JSON.stringify(orderData),
-    });
+    const parseJson = async (response: Response) => {
+      try {
+        return await response.json();
+      } catch (_error) {
+        return null;
+      }
+    };
 
-    let orderResult: any = null;
-    try {
-      orderResult = await orderResponse.json();
-    } catch (_error) {
-      orderResult = null;
-    }
+    const createOrder = async (): Promise<FetchOutcome> => {
+      const requestId = randomUUID().replace(/-/g, '');
 
-    if (!orderResponse.ok) {
-      return res.status(orderResponse.status || 502).json({
-        success: false,
-        error: 'Order creation failed',
-        details: orderResult
-      });
-    }
-
-    if (!orderResult?.id) {
-      return res.status(502).json({
-        success: false,
-        error: 'Order creation failed',
-        details: orderResult
-      });
-    }
-
-    // Step 3: Capture Payment
-    const captureResponse = await fetch(
-      `${baseUrl}/v2/checkout/orders/${orderResult.id}/capture`,
-      {
+      const response = await fetch(`${baseUrl}/v2/checkout/orders`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
           'Authorization': `Bearer ${tokenData.access_token}`,
-          'PayPal-Request-Id': randomUUID().replace(/-/g, ''),
+          'PayPal-Request-Id': requestId,
           'Prefer': 'return=representation'
         },
+        body: JSON.stringify(orderData),
+      });
+
+      return {
+        response,
+        result: await parseJson(response)
+      };
+    };
+
+    const captureOrder = async (orderId: string): Promise<FetchOutcome> => {
+      const response = await fetch(
+        `${baseUrl}/v2/checkout/orders/${orderId}/capture`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': `Bearer ${tokenData.access_token}`,
+            'PayPal-Request-Id': randomUUID().replace(/-/g, ''),
+            'Prefer': 'return=representation'
+          },
+        }
+      );
+
+      return {
+        response,
+        result: await parseJson(response)
+      };
+    };
+
+    type PaymentAttempt =
+      | { success: true; order: FetchOutcome; capture: FetchOutcome }
+      | { success: false; stage: 'order'; order: FetchOutcome }
+      | { success: false; stage: 'capture'; order: FetchOutcome; capture: FetchOutcome };
+
+    const executePaymentAttempt = async (): Promise<PaymentAttempt> => {
+      const order = await createOrder();
+
+      if (!order.response.ok || !order.result?.id) {
+        return {
+          success: false,
+          stage: 'order',
+          order
+        };
       }
-    );
 
-    let captureResult: any = null;
-    try {
-      captureResult = await captureResponse.json();
-    } catch (_error) {
-      captureResult = null;
-    }
+      const capture = await captureOrder(order.result.id);
 
-    if (captureResponse.ok && captureResult?.status === 'COMPLETED') {
+      if (capture.response.ok && capture.result?.status === 'COMPLETED') {
+        return {
+          success: true,
+          order,
+          capture
+        };
+      }
+
+      return {
+        success: false,
+        stage: 'capture',
+        order,
+        capture
+      };
+    };
+
+    const sendSuccessResponse = (attempt: Extract<PaymentAttempt, { success: true }>) => {
+      const captureDetails = attempt.capture.result;
       return res.status(200).json({
         success: true,
         message: 'Payment captured successfully',
-        orderId: captureResult.id,
-        status: captureResult.status,
-        details: captureResult
+        orderId: attempt.order.result.id,
+        captureId: captureDetails?.id,
+        status: captureDetails?.status,
+        details: captureDetails
       });
-    } else {
-      const failureStatus = captureResponse.status >= 400
-        ? captureResponse.status
-        : 502;
+    };
 
-      return res.status(failureStatus).json({
+    const firstAttempt = await executePaymentAttempt();
+
+    if (firstAttempt.success) {
+      return sendSuccessResponse(firstAttempt);
+    }
+
+    if (firstAttempt.stage === 'order') {
+      const statusCode = firstAttempt.order.response.status || 502;
+      return res.status(statusCode).json({
         success: false,
-        error: 'Payment capture failed',
-        details: captureResult
+        error: 'Order creation failed',
+        details: firstAttempt.order.result
       });
     }
+
+    const extractIssueCodes = (details: any): string[] => {
+      if (!Array.isArray(details)) {
+        return [];
+      }
+
+      return details
+        .map((detail) => (typeof detail?.issue === 'string' ? detail.issue : undefined))
+        .filter((issue): issue is string => Boolean(issue));
+    };
+
+    const initialCaptureIssues = extractIssueCodes(firstAttempt.capture.result?.details);
+
+    if (initialCaptureIssues.includes('ORDER_ALREADY_CAPTURED')) {
+      const retryAttempt = await executePaymentAttempt();
+
+      if (retryAttempt.success) {
+        return sendSuccessResponse(retryAttempt);
+      }
+
+      if (retryAttempt.stage === 'order') {
+        const statusCode = retryAttempt.order.response.status || 502;
+        return res.status(statusCode).json({
+          success: false,
+          error: 'Order creation failed',
+          details: retryAttempt.order.result,
+          attempts: {
+            initialCapture: firstAttempt.capture.result
+          }
+        });
+      }
+
+      const retryFailureStatus = retryAttempt.capture.response.status >= 400
+        ? retryAttempt.capture.response.status
+        : 502;
+
+      return res.status(retryFailureStatus).json({
+        success: false,
+        error: 'Payment capture failed',
+        details: retryAttempt.capture.result,
+        attempts: {
+          initialCapture: firstAttempt.capture.result,
+          retryCapture: retryAttempt.capture.result
+        }
+      });
+    }
+
+    const failureStatus = firstAttempt.capture.response.status >= 400
+      ? firstAttempt.capture.response.status
+      : 502;
+
+    return res.status(failureStatus).json({
+      success: false,
+      error: 'Payment capture failed',
+      details: firstAttempt.capture.result
+    });
   } catch (error: any) {
-    return res.status(500).json({ 
+    return res.status(500).json({
       success: false,
       error: error.message || 'Payment processing failed',
       details: error
