@@ -138,19 +138,14 @@ export default async function handler(
     };
 
     if (firstName || lastName) {
-      const namePayload: Record<string, string> = {};
       const normalizedFirstName = toOptionalString(firstName);
       const normalizedLastName = toOptionalString(lastName);
+      const fullName = [normalizedFirstName, normalizedLastName]
+        .filter((value): value is string => Boolean(value))
+        .join(' ');
 
-      if (normalizedFirstName) {
-        namePayload.given_name = normalizedFirstName;
-      }
-      if (normalizedLastName) {
-        namePayload.surname = normalizedLastName;
-      }
-
-      if (Object.keys(namePayload).length > 0) {
-        cardPayload.name = namePayload;
+      if (fullName) {
+        cardPayload.name = fullName;
       }
     }
 
